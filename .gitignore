@@ -1,0 +1,10 @@
+cat > .gitignore << 'EOF'
+venv/
+temp_uploads/
+__pycache__/
+*.pyc
+.env
+*.wav
+*.mp3
+*.m4a
+EOF
