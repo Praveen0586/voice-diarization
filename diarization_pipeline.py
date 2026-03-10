@@ -5,15 +5,21 @@ import time
 import subprocess
 import json
 from concurrent.futures import ThreadPoolExecutor
-from pyannote.audio import Pipeline
+from huggingface_hub import login
 import torch
+
+# ✅ Authenticate BEFORE importing pyannote — avoids all token-passing issues
+_hf_token = os.environ.get("HF_TOKEN", "")
+if _hf_token:
+    login(token=_hf_token, add_to_git_credential=False)
+
+from pyannote.audio import Pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-hf_token = os.environ.get("HF_TOKEN", "")
-if not hf_token:
+if not _hf_token:
     logging.warning("HF_TOKEN not set. Pyannote may fail.")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -30,8 +36,7 @@ try:
     )
     logging.info(f"Loading Pyannote on: {device}")
     diarization_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=hf_token
+        "pyannote/speaker-diarization-3.1"
     )
     if device != "cpu":
         diarization_pipeline.to(torch.device(device))
@@ -62,7 +67,6 @@ async def process_audio_file(file_path: str):
 
     logging.info("🎙️  Launching Whisper + Pyannote in parallel...")
 
-    # Run both in parallel — Pyannote on MPS (fast ~10s), Whisper on CPU
     whisper_task     = loop.run_in_executor(_whisper_executor, _run_whisper, file_path)
     diarization_task = loop.run_in_executor(_diarize_executor, _run_diarization, file_path)
 
@@ -91,9 +95,6 @@ def _run_whisper(file_path: str) -> list:
     base_out = file_path.replace(".wav", "")
     json_out = base_out + ".json"
 
-    # ✅ Key tuning: beam_size=1 (greedy) = 2x faster, minimal quality loss
-    # ✅ best_of=1 — no sampling overhead
-    # ✅ all 16 threads for single process
     cmd = [
         WHISPER_CLI,
         "--model",       WHISPER_MODEL,
@@ -102,11 +103,11 @@ def _run_whisper(file_path: str) -> list:
         "--output-file", base_out,
         "--word-thold",  "0.01",
         "--max-len",     "1",
-        "--threads",     "16",      # ✅ use all CPU threads
+        "--threads",     "16",
         "--language",    "auto",
-        "--beam-size",   "1",       # ✅ greedy decode = 2x faster
-        "--best-of",     "1",       # ✅ no sampling = faster
-        "--no-fallback",            # ✅ skip fallback attempts
+        "--beam-size",   "1",
+        "--best-of",     "1",
+        "--no-fallback",
     ]
 
     subprocess.run(cmd, capture_output=True, text=True)
@@ -158,7 +159,6 @@ def _run_diarization(file_path: str) -> list:
 
     speaker_segments = []
     for turn, _, speaker in result.itertracks(yield_label=True):
-        logging.info(f"🔊 [Pyannote] {speaker}: [{turn.start:.1f}s→{turn.end:.1f}s]")
         speaker_segments.append({
             "start":   round(turn.start, 3),
             "end":     round(turn.end, 3),
