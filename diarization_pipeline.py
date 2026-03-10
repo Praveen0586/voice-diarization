@@ -16,9 +16,10 @@ hf_token = os.environ.get("HF_TOKEN", "")
 if not hf_token:
     logging.warning("HF_TOKEN not set. Pyannote may fail.")
 
-# ── Whisper.cpp config ─────────────────────────────────────────────────────────
-WHISPER_CLI     = "/usr/local/bin/whisper-cli"
-WHISPER_MODEL   = os.path.expanduser("~/.cache/whisper/ggml-medium.bin")  # change to ggml-large-v3.bin for best quality
+# ── Config ─────────────────────────────────────────────────────────────────────
+WHISPER_CLI       = "/usr/local/bin/whisper-cli"
+WHISPER_MODEL     = os.path.expanduser("~/.cache/whisper/ggml-medium.bin")
+INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "600"))
 
 # ── Load Pyannote ──────────────────────────────────────────────────────────────
 try:
@@ -39,7 +40,7 @@ except Exception as e:
     logging.error(f"Pyannote load failed: {e}")
     diarization_pipeline = None
 
-# ── Verify whisper-cli exists ──────────────────────────────────────────────────
+# ── Verify whisper-cli ─────────────────────────────────────────────────────────
 if not os.path.exists(WHISPER_CLI):
     logging.error(f"whisper-cli not found at {WHISPER_CLI}")
     whisper_ok = False
@@ -47,9 +48,7 @@ else:
     logging.info(f"✅ whisper-cli found at {WHISPER_CLI}")
     whisper_ok = True
 
-INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "300"))
-
-# ✅ Dedicated thread pools
+# ── Dedicated thread pools — one each, no contention ──────────────────────────
 _whisper_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
 _diarize_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="diarize")
 
@@ -59,77 +58,66 @@ async def process_audio_file(file_path: str):
         raise RuntimeError("Models not fully initialized.")
 
     loop = asyncio.get_event_loop()
-
-    logging.info("🎙️  [1/4] Launching Whisper.cpp + Pyannote in parallel...")
     t_start = time.time()
 
-    whisper_task    = loop.run_in_executor(_whisper_executor, _run_whisper, file_path)
+    logging.info("🎙️  Launching Whisper + Pyannote in parallel...")
+
+    # Run both in parallel — Pyannote on MPS (fast ~10s), Whisper on CPU
+    whisper_task     = loop.run_in_executor(_whisper_executor, _run_whisper, file_path)
     diarization_task = loop.run_in_executor(_diarize_executor, _run_diarization, file_path)
 
     try:
-        transcription_words, diarization = await asyncio.wait_for(
+        words, diarization = await asyncio.wait_for(
             asyncio.gather(whisper_task, diarization_task),
             timeout=INFERENCE_TIMEOUT
         )
     except asyncio.TimeoutError:
-        raise RuntimeError(f"Inference timed out after {INFERENCE_TIMEOUT}s.")
+        raise RuntimeError(f"Timed out after {INFERENCE_TIMEOUT}s.")
 
-    logging.info(f"✅ [3/4] Both done in {time.time() - t_start:.1f}s — merging...")
+    logging.info(f"✅ Both done in {time.time() - t_start:.1f}s — merging...")
 
-    if not transcription_words:
-        logging.warning("⚠️  Whisper returned 0 words — check audio quality.")
+    if not words:
+        logging.warning("⚠️  Whisper returned 0 words.")
 
-    merged = _merge_results(transcription_words, diarization)
-    logging.info(f"🏁 [4/4] Merge complete — {len(merged)} speaker segments")
+    merged = _merge_results(words, diarization)
+    logging.info(f"🏁 Complete — {len(merged)} segments in {time.time() - t_start:.1f}s")
     return merged
 
 
-def _run_whisper(file_path: str):
-    logging.info("📝 [Whisper.cpp] Starting transcription...")
+def _run_whisper(file_path: str) -> list:
+    logging.info("📝 [Whisper] Starting...")
     t = time.time()
 
-    # whisper-cli --output-file takes a BASE path (no extension)
-    # it will write <base>.json automatically
     base_out = file_path.replace(".wav", "")
     json_out = base_out + ".json"
 
+    # ✅ Key tuning: beam_size=1 (greedy) = 2x faster, minimal quality loss
+    # ✅ best_of=1 — no sampling overhead
+    # ✅ all 16 threads for single process
     cmd = [
         WHISPER_CLI,
-        "--model",        WHISPER_MODEL,
-        "--file",         file_path,
+        "--model",       WHISPER_MODEL,
+        "--file",        file_path,
         "--output-json",
-        "--output-file",  base_out,     # ✅ no extension — whisper appends .json itself
-        "--word-thold",   "0.01",
-        "--max-len",      "1",          # ✅ force word-level segments
-        "--threads",      "8",
-        "--language",     "auto",
+        "--output-file", base_out,
+        "--word-thold",  "0.01",
+        "--max-len",     "1",
+        "--threads",     "16",      # ✅ use all CPU threads
+        "--language",    "auto",
+        "--beam-size",   "1",       # ✅ greedy decode = 2x faster
+        "--best-of",     "1",       # ✅ no sampling = faster
+        "--no-fallback",            # ✅ skip fallback attempts
     ]
 
-    logging.info(f"📝 [Whisper.cpp] cmd: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    logging.info(f"📝 [Whisper.cpp] returncode: {result.returncode}")
-    if result.stderr:
-        logging.info(f"📝 [Whisper.cpp] stderr: {result.stderr[-500:]}")
-
-    # ✅ Also log stdout to see what whisper printed
-    if result.stdout:
-        logging.info(f"📝 [Whisper.cpp] stdout: {result.stdout[:500]}")
+    subprocess.run(cmd, capture_output=True, text=True)
 
     if not os.path.exists(json_out):
-        logging.error(f"❌ JSON not found at: {json_out}")
-        # list dir to debug
-        import glob
-        found = glob.glob(os.path.dirname(file_path) + "/*.json")
-        logging.error(f"❌ JSON files in dir: {found}")
+        logging.error(f"❌ JSON not found: {json_out}")
         return []
 
     with open(json_out, "r") as f:
         data = json.load(f)
 
-    logging.info(f"📝 [Whisper.cpp] JSON keys: {list(data.keys())}")
-
-    # cleanup
     try:
         os.remove(json_out)
     except Exception:
@@ -137,7 +125,6 @@ def _run_whisper(file_path: str):
 
     words = []
     for segment in data.get("transcription", []):
-        # Try word-level tokens first
         tokens = segment.get("tokens", [])
         if tokens:
             for token in tokens:
@@ -151,7 +138,6 @@ def _run_whisper(file_path: str):
                     "text":  text
                 })
         else:
-            # Fallback: use segment-level timestamps
             text = segment.get("text", "").strip()
             if text:
                 offsets = segment.get("offsets", {})
@@ -161,12 +147,12 @@ def _run_whisper(file_path: str):
                     "text":  text
                 })
 
-    logging.info(f"✅ [Whisper.cpp] Done in {time.time() - t:.1f}s — {len(words)} words")
+    logging.info(f"✅ [Whisper] Done in {time.time()-t:.1f}s — {len(words)} words")
     return words
 
 
-def _run_diarization(file_path: str):
-    logging.info("🔊 [Pyannote] Starting diarization...")
+def _run_diarization(file_path: str) -> list:
+    logging.info("🔊 [Pyannote] Starting...")
     t = time.time()
     result = diarization_pipeline(file_path)
 
@@ -179,11 +165,11 @@ def _run_diarization(file_path: str):
             "speaker": speaker
         })
 
-    logging.info(f"✅ [Pyannote] Done in {time.time() - t:.1f}s — {len(speaker_segments)} turns")
+    logging.info(f"✅ [Pyannote] Done in {time.time()-t:.1f}s — {len(speaker_segments)} turns")
     return speaker_segments
 
 
-def _merge_results(words, speaker_segments):
+def _merge_results(words: list, speaker_segments: list) -> list:
     logging.info("🔀 [Merge] Aligning words with speaker labels...")
 
     if not words:
@@ -207,8 +193,7 @@ def _merge_results(words, speaker_segments):
             "speaker": best_speaker
         })
 
-    # ── Group consecutive same-speaker words ──────────────────────────────────
-    grouped = []
+    grouped     = []
     cur_speaker = aligned_words[0]["speaker"]
     cur_words   = [aligned_words[0]["text"]]
     cur_start   = aligned_words[0]["start"]
